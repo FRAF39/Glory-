@@ -1,0 +1,128 @@
+
+name: Extract ZIP Files
+
+on:
+  workflow_dispatch:
+
+  push:
+    paths:
+      - "*.zip"
+      - "**/*.zip"
+
+permissions:
+  contents: write
+
+concurrency:
+  group: extract-zip-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  extract:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          persist-credentials: true
+
+      - name: Find and Extract All ZIP Files
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          mapfile -d '' ZIP_FILES < <(
+            find . -type f -iname "*.zip" \
+              -not -path "./.git/*" -print0
+          )
+
+          if [ ${#ZIP_FILES[@]} -eq 0 ]; then
+            echo "No ZIP files found."
+            exit 0
+          fi
+
+          for ZIP_FILE in "${ZIP_FILES[@]}"; do
+
+            echo "================================"
+            echo "Extracting: $ZIP_FILE"
+            echo "================================"
+
+            TEMP_DIR=$(mktemp -d "$RUNNER_TEMP/zip.XXXXXX")
+
+            # Safely extract ZIP files
+            python3 - "$ZIP_FILE" "$TEMP_DIR" <<'PY'
+          import sys
+          import zipfile
+          from pathlib import PurePosixPath
+
+          zip_file = sys.argv[1]
+          destination = sys.argv[2]
+
+          with zipfile.ZipFile(zip_file, "r") as archive:
+              for item in archive.infolist():
+                  name = item.filename
+                  path = PurePosixPath(name)
+
+                  if (
+                      path.is_absolute()
+                      or ".." in path.parts
+                      or ".git" in path.parts
+                      or "\\" in name
+                  ):
+                      raise ValueError(
+                          f"Unsafe ZIP path rejected: {name}"
+                      )
+
+              archive.extractall(destination)
+
+          print("ZIP extracted safely.")
+          PY
+
+            # Detect single root directory
+            mapfile -d '' ENTRIES < <(
+              find "$TEMP_DIR" -mindepth 1 -maxdepth 1 -print0
+            )
+
+            if [ ${#ENTRIES[@]} -eq 1 ] && [ -d "${ENTRIES[0]}" ]; then
+
+              echo "Single root folder detected."
+
+              cp -a "${ENTRIES[0]}"/. .
+
+            else
+
+              echo "Extracting contents directly."
+
+              cp -a "$TEMP_DIR"/. .
+
+            fi
+
+            # Delete ZIP after successful extraction
+            rm -f -- "$ZIP_FILE"
+
+            rm -rf "$TEMP_DIR"
+
+            echo "Extraction completed: $ZIP_FILE"
+
+          done
+
+      - name: Commit and Push Changes
+        shell: bash
+        run: |
+          set -e
+
+          git config user.name "github-actions[bot]"
+          git config user.email \
+            "41898282+github-actions[bot]@users.noreply.github.com"
+
+          git add -A
+
+          if git diff --cached --quiet; then
+            echo "No changes to commit."
+          else
+            git commit -m "Auto extract ZIP files"
+            git push origin HEAD:${GITHUB_REF_NAME}
+          fi
+
+      - name: Workflow Completed
+        run: echo "All ZIP extraction tasks completed successfully!"
